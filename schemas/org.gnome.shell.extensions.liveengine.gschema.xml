@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.liveengine" path="/org/gnome/shell/extensions/liveengine/">
+    <key name="source-path" type="s">
+      <default>""</default>
+      <summary>Current wallpaper file</summary>
+      <description>Absolute path of the video or GIF currently shown as wallpaper.</description>
+    </key>
+    <key name="playlist-folder" type="s">
+      <default>""</default>
+      <summary>Playlist folder</summary>
+      <description>Folder scanned for videos and GIFs when auto-change is enabled.</description>
+    </key>
+    <key name="playlist-files" type="as">
+      <default>[]</default>
+      <summary>Explicit playlist</summary>
+      <description>Optional list of files. Used instead of the folder when non-empty.</description>
+    </key>
+    <key name="auto-change" type="b">
+      <default>false</default>
+      <summary>Auto change wallpaper</summary>
+    </key>
+    <key name="interval-minutes" type="i">
+      <default>5</default>
+      <range min="1" max="15"/>
+      <summary>Change interval in minutes</summary>
+    </key>
+    <key name="playlist-order" type="s">
+      <choices>
+        <choice value="sequential"/>
+        <choice value="shuffle"/>
+      </choices>
+      <default>"sequential"</default>
+      <summary>Playlist order</summary>
+    </key>
+    <key name="scale-mode" type="s">
+      <choices>
+        <choice value="fill"/>
+        <choice value="fit"/>
+        <choice value="stretch"/>
+        <choice value="center"/>
+      </choices>
+      <default>"fill"</default>
+      <summary>Scale mode</summary>
+    </key>
+    <key name="per-monitor" type="b">
+      <default>false</default>
+      <summary>Independent wallpaper per monitor</summary>
+      <description>When false, the same decoded stream is shown on every monitor.</description>
+    </key>
+    <key name="crossfade" type="b">
+      <default>true</default>
+      <summary>Crossfade between wallpapers</summary>
+    </key>
+    <key name="crossfade-ms" type="i">
+      <default>600</default>
+      <range min="0" max="3000"/>
+      <summary>Crossfade duration in milliseconds</summary>
+    </key>
+    <key name="play-on-lock-screen" type="b">
+      <default>true</default>
+      <summary>Play on lock screen</summary>
+    </key>
+    <key name="pause-on-fullscreen" type="b">
+      <default>false</default>
+      <summary>Pause when an app is fullscreen</summary>
+    </key>
+    <key name="pause-when-covered" type="b">
+      <default>false</default>
+      <summary>Pause when wallpaper is fully covered</summary>
+      <description>Treat a maximized window that covers the monitor as covering the wallpaper.</description>
+    </key>
+    <key name="pause-on-low-battery" type="b">
+      <default>false</default>
+      <summary>Pause when battery is low</summary>
+    </key>
+    <key name="battery-threshold" type="i">
+      <default>20</default>
+      <range min="5" max="50"/>
+      <summary>Low-battery threshold percent</summary>
+    </key>
+    <key name="battery-only-discharging" type="b">
+      <default>true</default>
+      <summary>Only pause on battery when not charging</summary>
+    </key>
+    <key name="mute" type="b">
+      <default>true</default>
+      <summary>Mute wallpaper audio</summary>
+    </key>
+    <key name="volume" type="i">
+      <default>50</default>
+      <range min="0" max="100"/>
+      <summary>Wallpaper volume percent</summary>
+    </key>
+    <key name="max-fps" type="i">
+      <default>30</default>
+      <range min="5" max="60"/>
+      <summary>Maximum frame rate</summary>
+    </key>
+    <key name="show-indicator" type="b">
+      <default>true</default>
+      <summary>Show Quick Settings indicator</summary>
+    </key>
+    <key name="user-paused" type="b">
+      <default>false</default>
+      <summary>Manually paused by the user</summary>
+    </key>
+    <key name="startup-delay-ms" type="i">
+      <default>1500</default>
+      <range min="0" max="10000"/>
+      <summary>Delay before starting the renderer after login</summary>
+    </key>
+  </schema>
+</schemalist>
