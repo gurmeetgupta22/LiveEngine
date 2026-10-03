@@ -125,6 +125,13 @@ NVIDIA_DECODERS = (
 
 LONG_PAUSE_MS = 90_000
 
+# VIDEO | AUDIO | SOFT_VOLUME | DEINTERLACE | SOFT_COLORBALANCE.
+# Native-video overlays use a black colour-key, which makes dark pixels flicker.
+PLAY_FLAGS = 0x0001 | 0x0002 | 0x0010 | 0x0200 | 0x0400
+
+# GstGtk4Paintable stores GdkRGBA as 0xRRGGBBAA. Opaque black, not transparent.
+OPAQUE_BLACK = 0x000000FF
+
 
 def log(message: str) -> None:
     print(f"liveengine-renderer: {message}", file=sys.stderr, flush=True)
@@ -146,6 +153,22 @@ def path_to_uri(path: str) -> str:
     if path.startswith("file:"):
         return path
     return Gio.File.new_for_path(path).get_uri()
+
+
+def looks_like_media(path: str) -> bool:
+    lower = (path or "").lower()
+    return lower.endswith((".mp4", ".m4v", ".webm", ".gif", ".mkv", ".mov"))
+
+
+def source_is_readable(path: str) -> tuple[bool, str]:
+    if not path:
+        return False, "No file selected"
+    file = Gio.File.new_for_path(path)
+    if not file.query_exists(None):
+        return False, f"File not found: {path}"
+    if not looks_like_media(path):
+        return False, "Unsupported type. Use MP4, WebM, MKV, MOV, or GIF."
+    return True, "ok"
 
 
 def validate_file(path: str) -> tuple[bool, str]:
@@ -172,52 +195,66 @@ def validate_file(path: str) -> tuple[bool, str]:
         return False, err.message
 
 
+def _try_set(element, name: str, value) -> None:
+    if element is None:
+        return
+    try:
+        element.set_property(name, value)
+    except Exception:
+        pass
+
+
 def make_video_sink(fps: int):
+    """Opaque RGB sink. Avoid GL overlay/alpha paths that sparkle on black pixels."""
     gtksink = Gst.ElementFactory.make("gtk4paintablesink", "gtksink")
     if gtksink is None:
         raise RuntimeError(
             "GStreamer element gtk4paintablesink is missing. "
             "Install gstreamer1.0-gtk4."
         )
+    _try_set(gtksink, "qos", False)
+    _try_set(gtksink, "sync", True)
+
     paintable = gtksink.get_property("paintable")
+    _try_set(paintable, "background-color", OPAQUE_BLACK)
+    _try_set(paintable, "force-aspect-ratio", False)
+
+    convert = Gst.ElementFactory.make("videoconvert", "videoconvert")
+    _try_set(convert, "n-threads", 0)
+    _try_set(convert, "qos", False)
+
+    caps = Gst.ElementFactory.make("capsfilter", "opaque-caps")
+    if caps is not None:
+        caps.set_property(
+            "caps",
+            Gst.Caps.from_string("video/x-raw,format=(string){RGBx,BGRx}"),
+        )
 
     rate = Gst.ElementFactory.make("videorate", "videorate")
-    if rate is not None:
-        try:
-            rate.set_property("max-rate", int(fps))
-        except Exception:
-            pass
+    _try_set(rate, "max-rate", int(fps))
+    _try_set(rate, "drop-only", True)
+    _try_set(rate, "skip-to-first", True)
 
+    chain = [item for item in (convert, rate, caps, gtksink) if item is not None]
     wrap = Gst.Bin.new("liveengine-videosink")
-    sink_tail = gtksink
-    gl_context = None
-    try:
-        gl_context = paintable.get_property("gl-context")
-    except Exception:
-        gl_context = None
+    for element in chain:
+        wrap.add(element)
 
-    if gl_context is not None:
-        glbin = Gst.ElementFactory.make("glsinkbin", "glsinkbin")
-        if glbin is not None:
-            glbin.set_property("sink", gtksink)
-            sink_tail = glbin
+    linked = True
+    for left, right in zip(chain, chain[1:]):
+        if not left.link(right):
+            linked = False
+            break
 
-    if rate is not None:
-        wrap.add(rate)
-        wrap.add(sink_tail)
-        if not rate.link(sink_tail):
-            wrap.remove(rate)
-            pad = sink_tail.get_static_pad("sink")
-            wrap.add_pad(Gst.GhostPad.new("sink", pad))
-        else:
-            pad = rate.get_static_pad("sink")
-            wrap.add_pad(Gst.GhostPad.new("sink", pad))
-    else:
-        wrap.add(sink_tail)
-        pad = sink_tail.get_static_pad("sink")
-        wrap.add_pad(Gst.GhostPad.new("sink", pad))
+    if not linked:
+        wrap = Gst.Bin.new("liveengine-videosink")
+        wrap.add(gtksink)
+        chain = [gtksink]
 
-    return wrap, paintable
+    pad = chain[0].get_static_pad("sink")
+    wrap.add_pad(Gst.GhostPad.new("sink", pad))
+    wrap._videorate = rate if linked else None
+    return wrap, paintable, (rate if linked else None)
 
 
 class Player:
@@ -230,57 +267,108 @@ class Player:
         self.uri = ""
         self._bus = None
         self._about_id = None
+        self._rate = None
+        self._inv_id = 0
+        self._ready_timeout_id = 0
+        self._ready_cb = None
+        self._ready_gen = 0
+        self._ready_token = 0
+        self._awaiting_preroll = False
         self._rebuild(app.fps)
 
     def _rebuild(self, fps: int) -> None:
         self.stop(to_null=True)
+        self._disconnect_paintable()
         playbin = Gst.ElementFactory.make("playbin3", f"playbin-{self.slot}")
         if playbin is None:
             playbin = Gst.ElementFactory.make("playbin", f"playbin-{self.slot}")
         if playbin is None:
             raise RuntimeError("GStreamer playbin is not available")
 
-        video_sink, paintable = make_video_sink(fps)
+        video_sink, paintable, rate = make_video_sink(fps)
         playbin.set_property("video-sink", video_sink)
         playbin.set_property("volume", self.app.volume)
         playbin.set_property("mute", self.app.mute)
-
-        flags = playbin.get_property("flags")
-        # Keep audio + video; buffer and vis off. Soft-volume stays on.
         try:
-            playbin.set_property("flags", flags | 0x0003)
+            playbin.set_property("flags", PLAY_FLAGS)
         except Exception:
             pass
 
         self.playbin = playbin
         self.paintable = paintable
+        self._rate = rate
         self._bus = playbin.get_bus()
         self._bus.add_signal_watch()
         self._bus.connect("message", self._on_bus)
         self._about_id = playbin.connect("about-to-finish", self._on_about_to_finish)
 
     def set_fps(self, fps: int) -> None:
-        uri = self.uri
-        state = self.playbin.get_state(0)[1] if self.playbin else Gst.State.NULL
-        self._rebuild(fps)
-        if uri:
-            self.set_uri(uri)
-            if state == Gst.State.PLAYING:
-                self.play()
-            elif state == Gst.State.PAUSED:
-                self.pause()
+        _try_set(self._rate, "max-rate", int(fps))
+
+    def _disconnect_paintable(self) -> None:
+        if self.paintable is not None and self._inv_id:
+            try:
+                self.paintable.disconnect(self._inv_id)
+            except Exception:
+                pass
+        self._inv_id = 0
+
+    def _cancel_ready(self) -> None:
+        self._ready_gen += 1
+        self._ready_cb = None
+        self._awaiting_preroll = False
+        if self._ready_timeout_id:
+            GLib.Source.remove(self._ready_timeout_id)
+            self._ready_timeout_id = 0
+        self._disconnect_paintable()
 
     def set_uri(self, uri: str) -> None:
+        self._cancel_ready()
         self.uri = uri
+        if self.playbin is None:
+            return
+        # NULL first so playbin does not gapless-queue the URI behind the current clip.
+        self.playbin.set_state(Gst.State.NULL)
         self.playbin.set_property("uri", uri)
 
     def play(self) -> None:
-        self.playbin.set_state(Gst.State.PLAYING)
+        if self.playbin is not None:
+            self.playbin.set_state(Gst.State.PLAYING)
+
+    def play_when_ready(self, callback) -> None:
+        """Start playback and invoke callback after preroll (first frame at sink)."""
+        self._cancel_ready()
+        self._ready_token = self._ready_gen
+        self._ready_cb = callback
+        self._awaiting_preroll = True
+        self._ready_timeout_id = GLib.timeout_add(2500, self._fire_ready)
+        self.play()
+
+    def _fire_ready(self, *_args) -> bool:
+        if not self._awaiting_preroll or self._ready_token != self._ready_gen:
+            return GLib.SOURCE_REMOVE
+        cb = self._ready_cb
+        if cb is None:
+            return GLib.SOURCE_REMOVE
+        self._awaiting_preroll = False
+        self._ready_cb = None
+        timeout_id = self._ready_timeout_id
+        self._ready_timeout_id = 0
+        if timeout_id:
+            try:
+                GLib.Source.remove(timeout_id)
+            except Exception:
+                pass
+        self._disconnect_paintable()
+        cb()
+        return GLib.SOURCE_REMOVE
 
     def pause(self) -> None:
-        self.playbin.set_state(Gst.State.PAUSED)
+        if self.playbin is not None:
+            self.playbin.set_state(Gst.State.PAUSED)
 
     def stop(self, to_null: bool = False) -> None:
+        self._cancel_ready()
         if self.playbin is None:
             return
         self.playbin.set_state(Gst.State.NULL if to_null else Gst.State.READY)
@@ -299,24 +387,16 @@ class Player:
         self.playbin.set_property("volume", max(0.0, min(1.0, self.app.volume)))
 
     def query_has_audio(self) -> bool:
-        # playbin3 doesn't have 'n-audio' property; try multiple approaches
+        n = 0
         try:
             n = int(self.playbin.get_property("n-audio") or 0)
-        except TypeError:
-            # playbin3: check n-audio on the underlying uridecodebin/decoder
+        except (TypeError, AttributeError):
             try:
-                n = int(self.playbin.get_property("n-audio") or 0)
-            except TypeError:
-                # Fallback: query via get_property on the actual audio sink or use stream collection
-                # For now, assume has audio if any audio pad exists
+                sink = self.playbin.get_property("audio-sink")
+                if sink:
+                    n = 1
+            except Exception:
                 n = 0
-                try:
-                    # Try to get audio pads from the pipeline
-                    pads = self.playbin.get_property("audio-sink")
-                    if pads:
-                        n = 1
-                except:
-                    pass
         self.has_audio = n > 0
         return self.has_audio
 
@@ -342,8 +422,14 @@ class Player:
         elif t == Gst.MessageType.STREAM_COLLECTION:
             has_audio = self.query_has_audio()
             self.app.notify_has_audio(has_audio)
+        elif t == Gst.MessageType.ASYNC_DONE:
+            if message.src == self.playbin and self._awaiting_preroll:
+                state = self.playbin.get_state(0)[1]
+                if state in (Gst.State.PAUSED, Gst.State.PLAYING):
+                    self._fire_ready()
 
     def dispose(self) -> None:
+        self._cancel_ready()
         if self.playbin is None:
             return
         if self._bus is not None:
@@ -355,6 +441,7 @@ class Player:
                 pass
         self.playbin.set_state(Gst.State.NULL)
         self.playbin = None
+        self._rate = None
 
 
 class WallpaperWindow(Gtk.ApplicationWindow):
@@ -366,35 +453,60 @@ class WallpaperWindow(Gtk.ApplicationWindow):
         self.set_deletable(False)
         self.set_focusable(False)
         self.set_can_focus(False)
+        self.set_opacity(1.0)
         self.set_default_size(monitor.get_geometry().width, monitor.get_geometry().height)
 
         css = Gtk.CssProvider()
-        css.load_from_data(b"window { background: #000; }")
+        css.load_from_data(
+            b"window, overlay, picture { background-color: #000000; background: #000000; }"
+        )
         self.get_style_context().add_provider(css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
-        self.stack = Gtk.Stack(
-            transition_type=Gtk.StackTransitionType.CROSSFADE,
-            transition_duration=app.crossfade_ms if app.crossfade else 0,
-            hexpand=True,
-            vexpand=True,
-        )
+        # Keep both pictures mapped so gtk4paintablesink can preroll the hidden
+        # player. Gtk.Stack unmaps the hidden child, which made the first switch
+        # flash black and keep the old file.
+        self._overlay = Gtk.Overlay(hexpand=True, vexpand=True)
         self.picture_a = Gtk.Picture(hexpand=True, vexpand=True)
         self.picture_b = Gtk.Picture(hexpand=True, vexpand=True)
-        self.picture_a.set_content_fit(CONTENT_FIT.get(app.scale_mode, Gtk.ContentFit.COVER))
-        self.picture_b.set_content_fit(CONTENT_FIT.get(app.scale_mode, Gtk.ContentFit.COVER))
-        self.stack.add_named(self.picture_a, "a")
-        self.stack.add_named(self.picture_b, "b")
-        self.set_child(self.stack)
+        fit = CONTENT_FIT.get(app.scale_mode, Gtk.ContentFit.COVER)
+        self.picture_a.set_content_fit(fit)
+        self.picture_b.set_content_fit(fit)
+        self._overlay.set_child(self.picture_a)
+        self._overlay.add_overlay(self.picture_b)
+        self.picture_b.set_opacity(0.0)
+        self.picture_a.set_opacity(1.0)
+        self.set_child(self._overlay)
+        self._slot = "a"
+        self._fade_id = 0
+        self._crossfade_ms = app.crossfade_ms if app.crossfade else 0
 
         self.connect("realize", self._on_realize)
 
     def _on_realize(self, *_args) -> None:
         try:
             surface = self.get_surface()
-            if surface is not None and cairo is not None:
-                surface.set_input_region(cairo.Region())
+            if surface is None:
+                return
+            self._apply_surface_regions(surface)
+            for name in ("notify::width", "notify::height", "layout"):
+                try:
+                    surface.connect(name, lambda *_: self._apply_surface_regions(surface))
+                except TypeError:
+                    pass
         except Exception as err:
-            log(f"could not clear input region: {err}")
+            log(f"could not configure surface regions: {err}")
+
+    def _apply_surface_regions(self, surface) -> None:
+        if cairo is None:
+            return
+        try:
+            width = max(1, surface.get_width())
+            height = max(1, surface.get_height())
+            full = cairo.Region(cairo.RectangleInt(0, 0, width, height))
+            surface.set_opaque_region(full)
+            surface.set_input_region(cairo.Region())
+        except Exception as err:
+            log(f"could not set opaque/input regions: {err}")
 
     def bind_paintables(self, a, b) -> None:
         if a is not None:
@@ -403,7 +515,36 @@ class WallpaperWindow(Gtk.ApplicationWindow):
             self.picture_b.set_paintable(b)
 
     def show_slot(self, slot: str) -> None:
-        self.stack.set_visible_child_name(slot)
+        self.transition_to(slot, 0)
+
+    def transition_to(self, slot: str, duration_ms: int) -> None:
+        if self._fade_id:
+            GLib.Source.remove(self._fade_id)
+            self._fade_id = 0
+        self._slot = slot
+        target_a = 1.0 if slot == "a" else 0.0
+        target_b = 1.0 if slot == "b" else 0.0
+        if duration_ms <= 0:
+            self.picture_a.set_opacity(target_a)
+            self.picture_b.set_opacity(target_b)
+            return
+
+        start_a = self.picture_a.get_opacity()
+        start_b = self.picture_b.get_opacity()
+        t0 = GLib.get_monotonic_time()
+        duration_us = max(1, int(duration_ms)) * 1000
+
+        def tick():
+            p = min(1.0, (GLib.get_monotonic_time() - t0) / duration_us)
+            e = p * p * (3.0 - 2.0 * p)
+            self.picture_a.set_opacity(start_a + (target_a - start_a) * e)
+            self.picture_b.set_opacity(start_b + (target_b - start_b) * e)
+            if p >= 1.0:
+                self._fade_id = 0
+                return GLib.SOURCE_REMOVE
+            return GLib.SOURCE_CONTINUE
+
+        self._fade_id = GLib.timeout_add(16, tick)
 
     def apply_scale(self, mode: str) -> None:
         fit = CONTENT_FIT.get(mode, Gtk.ContentFit.COVER)
@@ -411,10 +552,7 @@ class WallpaperWindow(Gtk.ApplicationWindow):
         self.picture_b.set_content_fit(fit)
 
     def apply_crossfade(self, enabled: bool, duration_ms: int) -> None:
-        self.stack.set_transition_duration(duration_ms if enabled else 0)
-        self.stack.set_transition_type(
-            Gtk.StackTransitionType.CROSSFADE if enabled else Gtk.StackTransitionType.NONE
-        )
+        self._crossfade_ms = duration_ms if enabled else 0
 
 
 class RendererApp(Gtk.Application):
@@ -437,6 +575,8 @@ class RendererApp(Gtk.Application):
         self.owner_id = 0
         self.registration_id = 0
         self._long_pause_id = 0
+        self._stop_id = 0
+        self._switch_token = 0
         self._node_info = Gio.DBusNodeInfo.new_for_xml(IFACE_XML)
 
     def do_startup(self):
@@ -462,9 +602,7 @@ class RendererApp(Gtk.Application):
         monitors = display.get_monitors()
         count = monitors.get_n_items()
         if count == 0:
-            window = Gtk.ApplicationWindow(application=self, title=f"{WINDOW_TITLE_PREFIX}-0")
-            window.set_default_size(640, 360)
-            self.windows.append(self._fallback_window(window, 0))
+            self.windows.append(self._fallback_window(0))
             return
         for i in range(count):
             monitor = monitors.get_item(i)
@@ -474,29 +612,17 @@ class RendererApp(Gtk.Application):
             win.present()
             self.windows.append(win)
 
-    def _fallback_window(self, window, index):
-        window.set_decorated(False)
-        stack = Gtk.Stack()
-        pa = Gtk.Picture()
-        pb = Gtk.Picture()
-        stack.add_named(pa, "a")
-        stack.add_named(pb, "b")
-        window.set_child(stack)
-        window.stack = stack
-        window.picture_a = pa
-        window.picture_b = pb
-        window.monitor_index = index
-        window.bind_paintables = lambda a, b: (pa.set_paintable(a), pb.set_paintable(b))
-        window.show_slot = stack.set_visible_child_name
-        window.apply_scale = lambda mode: (
-            pa.set_content_fit(CONTENT_FIT.get(mode, Gtk.ContentFit.COVER)),
-            pb.set_content_fit(CONTENT_FIT.get(mode, Gtk.ContentFit.COVER)),
-        )
-        window.apply_crossfade = lambda enabled, ms: stack.set_transition_duration(ms if enabled else 0)
-        window.bind_paintables(self.player_a.paintable, self.player_b.paintable)
-        window.show_slot(self.active_slot)
-        window.present()
-        return window
+    def _fallback_window(self, index):
+        geo = Gdk.Rectangle()
+        geo.width, geo.height = 640, 360
+        class _Mon:
+            def get_geometry(self_mon):
+                return geo
+        win = WallpaperWindow(self, _Mon(), index)
+        win.bind_paintables(self.player_a.paintable, self.player_b.paintable)
+        win.show_slot(self.active_slot)
+        win.present()
+        return win
 
     def _on_bus_acquired(self, connection, _name):
         self.connection = connection
@@ -537,26 +663,53 @@ class RendererApp(Gtk.Application):
         return self.player_b if self.active_slot == "a" else self.player_a
 
     def play_source(self, path: str) -> None:
-        ok, message = validate_file(path)
+        ok, message = source_is_readable(path)
         if not ok:
             self.emit_error(message)
             return
         uri = path_to_uri(path)
-        incoming = self.inactive_player() if self.crossfade else self.active_player()
+        current = self.active_player()
+        if current.uri == uri:
+            state = current.playbin.get_state(0)[1] if current.playbin else Gst.State.NULL
+            if state in (Gst.State.PLAYING, Gst.State.PAUSED):
+                if not self.user_paused:
+                    current.play()
+                return
+
+        self._cancel_pending_stop()
+        self._switch_token += 1
+        token = self._switch_token
+        outgoing = current if current.uri else None
+        incoming = self.inactive_player() if outgoing is not None else current
+
         incoming.set_uri(uri)
         incoming.apply_audio()
-        incoming.play()
-        next_slot = incoming.slot
         for window in self.windows:
             window.bind_paintables(self.player_a.paintable, self.player_b.paintable)
-            window.show_slot(next_slot)
-        if self.crossfade and incoming is not self.active_player():
-            outgoing = self.active_player()
-            GLib.timeout_add(self.crossfade_ms + 50, self._stop_outgoing, outgoing)
-        self.active_slot = next_slot
-        self._cancel_long_pause()
+
+        def on_ready():
+            if token != self._switch_token:
+                return
+            duration = self.crossfade_ms if (self.crossfade and outgoing is not None) else 0
+            for window in self.windows:
+                window.transition_to(incoming.slot, duration)
+            self.active_slot = incoming.slot
+            if outgoing is not None and outgoing is not incoming:
+                delay = duration + 80
+                self._stop_id = GLib.timeout_add(
+                    max(80, delay), self._stop_outgoing, outgoing
+                )
+            self._cancel_long_pause()
+
+        incoming.play_when_ready(on_ready)
+
+    def _cancel_pending_stop(self) -> None:
+        if self._stop_id:
+            GLib.Source.remove(self._stop_id)
+            self._stop_id = 0
 
     def _stop_outgoing(self, player: Player):
+        self._stop_id = 0
         if player is not self.active_player():
             player.stop(to_null=True)
         return GLib.SOURCE_REMOVE
@@ -647,19 +800,8 @@ class RendererApp(Gtk.Application):
             invocation.return_value(None)
         elif method == "SetFps":
             (self.fps,) = parameters.unpack()
-            uri_a = self.player_a.uri
-            uri_b = self.player_b.uri
-            active = self.active_slot
             self.player_a.set_fps(self.fps)
             self.player_b.set_fps(self.fps)
-            for window in self.windows:
-                window.bind_paintables(self.player_a.paintable, self.player_b.paintable)
-            if active == "a" and uri_a:
-                self.player_a.set_uri(uri_a)
-                self.player_a.play()
-            elif uri_b:
-                self.player_b.set_uri(uri_b)
-                self.player_b.play()
             invocation.return_value(None)
         elif method == "SetCrossfade":
             enabled, duration = parameters.unpack()
@@ -687,6 +829,8 @@ class RendererApp(Gtk.Application):
             )
 
     def do_shutdown(self):
+        self._switch_token += 1
+        self._cancel_pending_stop()
         self._cancel_long_pause()
         if self.player_a:
             self.player_a.dispose()

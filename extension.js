@@ -131,12 +131,15 @@ export default class LiveEngineExtension extends Extension {
     _bindSettings() {
         const reload = key => this._settings.connect(`changed::${key}`, () => this._pushSettings());
         for (const key of [
-            'source-path', 'mute', 'volume', 'scale-mode', 'max-fps',
+            'mute', 'volume', 'scale-mode', 'max-fps',
             'crossfade', 'crossfade-ms', 'user-paused', 'play-on-lock-screen',
             'pause-on-fullscreen', 'pause-when-covered', 'pause-on-low-battery',
             'battery-threshold', 'battery-only-discharging', 'show-indicator',
         ])
             this._settingIds.push(reload(key));
+        this._settingIds.push(this._settings.connect('changed::source-path', () => {
+            this._applySource(this._settings.get_string('source-path'));
+        }));
     }
 
     _disconnectSettings() {
