@@ -7,7 +7,7 @@ import {RendererIpc} from './lib/ipc.js';
 import {PowerMonitor} from './lib/power.js';
 import {WindowMonitor} from './lib/windows.js';
 import {Playlist} from './lib/playlist.js';
-import {RendererProcess} from './lib/manager.js';
+import {RendererProcess, BackgroundPatcher} from './lib/manager.js';
 import {LiveEngineIndicator} from './lib/indicator.js';
 import * as Log from './lib/logger.js';
 
@@ -32,6 +32,12 @@ export default class LiveEngineExtension extends Extension {
         this._power = new PowerMonitor();
         this._windows = new WindowMonitor();
         this._playlist = new Playlist(this._settings);
+
+        // Create and enable the BackgroundPatcher so the live wallpaper also
+        // appears in the Activities overview and on the lock screen.
+        this._bgPatcher = new BackgroundPatcher(this._settings);
+        this._process.backgroundPatcher = this._bgPatcher;
+        this._bgPatcher.enable();
 
         this._process.onCrashExhausted = () => {
             Main.notify(
@@ -96,6 +102,9 @@ export default class LiveEngineExtension extends Extension {
 
         this._indicator?.destroy();
         this._indicator = null;
+
+        this._bgPatcher?.destroy();
+        this._bgPatcher = null;
 
         this._playlist?.destroy();
         this._windows?.destroy();
