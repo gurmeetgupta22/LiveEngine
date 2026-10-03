@@ -4,7 +4,7 @@ set -euo pipefail
 
 UUID="liveengine@gurmeet-gupta.github.io"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="${ROOT}/${UUID}"
+SRC="${ROOT}"
 DEST="${HOME}/.local/share/gnome-shell/extensions/${UUID}"
 
 if [[ ! -d "${SRC}" ]]; then
