@@ -19,6 +19,10 @@ export default class LiveEngineExtension extends Extension {
             return;
         }
 
+        this._enabled = true;
+        this._started = false;
+        this._startupId = 0;
+        this._startupIdleId = 0;
         this._settings = this.getSettings();
         this._timeouts = [];
         this._settingIds = [];
@@ -26,18 +30,14 @@ export default class LiveEngineExtension extends Extension {
         this._sessionId = 0;
         this._suspended = false;
         this._ipcReady = false;
+        this._indicator = null;
 
         this._ipc = new RendererIpc();
         this._process = new RendererProcess(this);
         this._power = new PowerMonitor();
         this._windows = new WindowMonitor();
         this._playlist = new Playlist(this._settings);
-
-        // Create and enable the BackgroundPatcher so the live wallpaper also
-        // appears in the Activities overview and on the lock screen.
         this._bgPatcher = new BackgroundPatcher(this._settings);
-        this._process.backgroundPatcher = this._bgPatcher;
-        this._bgPatcher.enable();
 
         this._process.onCrashExhausted = () => {
             Main.notify(
@@ -45,7 +45,6 @@ export default class LiveEngineExtension extends Extension {
                 _('The wallpaper renderer crashed repeatedly and was stopped.')
             );
         };
-
         this._ipc.onReady = () => this._onRendererReady();
         this._ipc.onError = message => {
             Log.error(message);
@@ -55,26 +54,13 @@ export default class LiveEngineExtension extends Extension {
         this._ipc.onNameVanished = () => {
             this._ipcReady = false;
         };
-
         this._power.onChanged = () => this._syncPlayback();
         this._windows.onChanged = () => this._syncPlayback();
         this._playlist.onChange = path => this._applySource(path);
 
         this._bindSettings();
-        this._connectSession();
         this._connectSleep();
-
-        this._indicator = new LiveEngineIndicator(this, this);
-        Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
-
-        const delay = this._settings.get_int('startup-delay-ms');
-        this._addTimeout(Math.max(0, delay), () => {
-            this._ipc.watch();
-            this._process.start();
-            this._power.start();
-            this._windows.start();
-            this._playlist.start();
-        });
+        this._scheduleStart();
     }
 
     /**
@@ -88,6 +74,9 @@ export default class LiveEngineExtension extends Extension {
             return;
         }
 
+        this._enabled = false;
+        this._started = false;
+        this._cancelShellWait();
         this._clearTimeouts();
         this._disconnectSettings();
 
@@ -122,6 +111,88 @@ export default class LiveEngineExtension extends Extension {
         this._process = null;
         this._settings = null;
         this._ipcReady = false;
+    }
+
+    _shellIsReady() {
+        if (Main.layoutManager._startingUp)
+            return false;
+        if (!Main.layoutManager._backgroundGroup)
+            return false;
+        if (!Main.layoutManager.monitors?.length)
+            return false;
+        if (!Main.panel?.statusArea?.quickSettings)
+            return false;
+        return true;
+    }
+
+    _cancelShellWait() {
+        if (this._startupId) {
+            Main.layoutManager.disconnect(this._startupId);
+            this._startupId = 0;
+        }
+        if (this._startupIdleId) {
+            GLib.Source.remove(this._startupIdleId);
+            this._startupIdleId = 0;
+        }
+    }
+
+    _scheduleStart() {
+        const afterShellReady = () => {
+            if (!this._enabled)
+                return;
+            let idlePasses = 0;
+            this._startupIdleId = GLib.idle_add(GLib.PRIORITY_LOW, () => {
+                if (!this._enabled) {
+                    this._startupIdleId = 0;
+                    return GLib.SOURCE_REMOVE;
+                }
+                // Let other extensions and the stock wallpaper finish first.
+                idlePasses += 1;
+                if (idlePasses < 3)
+                    return GLib.SOURCE_CONTINUE;
+                this._startupIdleId = 0;
+                const delay = Math.max(0, this._settings.get_int('startup-delay-ms'));
+                this._addTimeout(delay, () => this._start());
+                return GLib.SOURCE_REMOVE;
+            });
+        };
+
+        if (this._shellIsReady()) {
+            afterShellReady();
+            return;
+        }
+
+        Log.debug('Waiting for GNOME Shell startup-complete before starting LiveEngine');
+        this._startupId = Main.layoutManager.connect('startup-complete', () => {
+            if (this._startupId) {
+                Main.layoutManager.disconnect(this._startupId);
+                this._startupId = 0;
+            }
+            afterShellReady();
+        });
+    }
+
+    _start() {
+        if (!this._enabled || this._started)
+            return;
+        if (!this._shellIsReady()) {
+            this._scheduleStart();
+            return;
+        }
+
+        this._started = true;
+        this._process.backgroundPatcher = this._bgPatcher;
+        this._bgPatcher.enable();
+        this._connectSession();
+
+        this._indicator = new LiveEngineIndicator(this, this);
+        Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
+
+        this._ipc.watch();
+        this._process.start();
+        this._power.start();
+        this._windows.start();
+        this._playlist.start();
     }
 
     next() {

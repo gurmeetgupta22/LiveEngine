@@ -108,7 +108,7 @@
     <key name="startup-delay-ms" type="i">
       <default>1500</default>
       <range min="0" max="10000"/>
-      <summary>Delay before starting the renderer after login</summary>
+      <summary>Extra delay after GNOME Shell startup-complete before starting the renderer</summary>
     </key>
   </schema>
 </schemalist>

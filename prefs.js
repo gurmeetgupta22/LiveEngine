@@ -268,7 +268,7 @@ export default class LiveEnginePreferences extends ExtensionPreferences {
 
         const startup = new Adw.PreferencesGroup({title: _('Startup')});
         addSpin(startup, settings, 'startup-delay-ms', _('Start delay'),
-            _('Wait this many milliseconds after enable() so GNOME Shell is fully loaded.'), 0, 10000, 100);
+            _('Extra wait after GNOME Shell finishes starting. LiveEngine already waits for startup-complete so it does not fight other extensions at login.'), 0, 10000, 100);
         const indicator = new Adw.SwitchRow({
             title: _('Show Quick Settings tile'),
             subtitle: _('Pause, next wallpaper, and mute from the system menu.'),
