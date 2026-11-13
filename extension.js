@@ -30,6 +30,8 @@ export default class LiveEngineExtension extends Extension {
         this._sessionId = 0;
         this._suspended = false;
         this._ipcReady = false;
+        this._lastPauseAll = null;
+        this._lastPausedMonitors = null;
         this._indicator = null;
 
         this._ipc = new RendererIpc();
@@ -53,6 +55,8 @@ export default class LiveEngineExtension extends Extension {
         this._ipc.onHasAudioChanged = () => this._syncPlayback();
         this._ipc.onNameVanished = () => {
             this._ipcReady = false;
+            this._lastPauseAll = null;
+            this._lastPausedMonitors = null;
         };
         this._power.onChanged = () => this._syncPlayback();
         this._windows.onChanged = () => this._syncPlayback();
@@ -253,6 +257,8 @@ export default class LiveEngineExtension extends Extension {
 
     _onRendererReady() {
         this._ipcReady = true;
+        this._lastPauseAll = null;
+        this._lastPausedMonitors = null;
         this._process.noteHealthy();
         this._pushSettings();
         const path = this._settings.get_string('source-path') || this._playlist.current();
@@ -302,12 +308,21 @@ export default class LiveEngineExtension extends Extension {
         );
         const pauseAll = userPaused || batteryPaused || pauseOnLock || this._suspended;
 
-        if (pauseAll)
-            this._ipc.pause();
-        else
-            this._ipc.resume();
+        if (pauseAll !== this._lastPauseAll) {
+            if (pauseAll)
+                this._ipc.pause();
+            else
+                this._ipc.resume();
+            this._lastPauseAll = pauseAll;
+        }
 
-        this._ipc.setPausedMonitors([]);
+        const pausedMonitors = this._windows.pausedMonitors();
+        if (!this._lastPausedMonitors ||
+            pausedMonitors.length !== this._lastPausedMonitors.length ||
+            pausedMonitors.some((index, i) => index !== this._lastPausedMonitors[i])) {
+            this._ipc.setPausedMonitors(pausedMonitors);
+            this._lastPausedMonitors = pausedMonitors;
+        }
     }
 
     _addTimeout(ms, cb) {
