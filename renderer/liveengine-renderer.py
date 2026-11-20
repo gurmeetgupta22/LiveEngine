@@ -205,37 +205,30 @@ def _try_set(element, name: str, value) -> None:
 
 
 def make_video_sink(fps: int):
-    """Opaque RGB sink. Avoid GL overlay/alpha paths that sparkle on black pixels."""
+    """Use native video formats and let the GTK sink perform final composition."""
     gtksink = Gst.ElementFactory.make("gtk4paintablesink", "gtksink")
     if gtksink is None:
         raise RuntimeError(
             "GStreamer element gtk4paintablesink is missing. "
             "Install gstreamer1.0-gtk4."
         )
-    _try_set(gtksink, "qos", False)
+    # Allow the sink to report lateness upstream so overloaded systems drop
+    # frames instead of spending more CPU trying to catch up.
+    _try_set(gtksink, "qos", True)
     _try_set(gtksink, "sync", True)
 
     paintable = gtksink.get_property("paintable")
     _try_set(paintable, "background-color", OPAQUE_BLACK)
     _try_set(paintable, "force-aspect-ratio", False)
 
-    convert = Gst.ElementFactory.make("videoconvert", "videoconvert")
-    _try_set(convert, "n-threads", 0)
-    _try_set(convert, "qos", False)
-
-    caps = Gst.ElementFactory.make("capsfilter", "opaque-caps")
-    if caps is not None:
-        caps.set_property(
-            "caps",
-            Gst.Caps.from_string("video/x-raw,format=(string){RGBx,BGRx}"),
-        )
-
     rate = Gst.ElementFactory.make("videorate", "videorate")
     _try_set(rate, "max-rate", int(fps))
     _try_set(rate, "drop-only", True)
     _try_set(rate, "skip-to-first", True)
 
-    chain = [item for item in (convert, rate, caps, gtksink) if item is not None]
+    # Do not force RGBx here. gtk4paintablesink accepts native YUV formats and
+    # can keep VA-API/DMABuf frames on the accelerated path where available.
+    chain = [item for item in (rate, gtksink) if item is not None]
     wrap = Gst.Bin.new("liveengine-videosink")
     for element in chain:
         wrap.add(element)

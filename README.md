@@ -49,6 +49,7 @@ The renderer process is launched with `__NV_PRIME_RENDER_OFFLOAD=0`, empty `CUDA
 - Pause on low battery via UPower `DisplayDevice` property changes (hidden when there is no battery)
 - Mute default on; live volume; no error when the file has no audio
 - Frame-rate cap (default 30) via `videorate max-rate`
+- Native video formats where supported, with sink QoS and a configurable frame-rate cap
 - Pipeline `PAUSED` when idle; `NULL` after 90 seconds to free the decoder
 - Auto-restart with exponential backoff, max 3 times, then a shell notification
 - Suspend/resume via `org.freedesktop.login1.Manager.PrepareForSleep`
