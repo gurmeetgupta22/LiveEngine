@@ -62,11 +62,11 @@
       <summary>Play on lock screen</summary>
     </key>
     <key name="pause-on-fullscreen" type="b">
-      <default>false</default>
+      <default>true</default>
       <summary>Pause when an app is fullscreen</summary>
     </key>
     <key name="pause-when-covered" type="b">
-      <default>false</default>
+      <default>true</default>
       <summary>Pause when wallpaper is fully covered</summary>
       <description>Treat a maximized window that covers the monitor as covering the wallpaper.</description>
     </key>

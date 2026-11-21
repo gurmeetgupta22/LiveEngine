@@ -18,8 +18,14 @@ os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", "mesa")
 os.environ.setdefault("__VK_LAYER_NV_optimus", "non_NVIDIA_only")
 os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
-if os.environ.get("LIBVA_DRIVER_NAME", "").lower() in ("nvidia", "nvdec", "vdpau"):
-    os.environ["LIBVA_DRIVER_NAME"] = "iHD"
+
+# Ensure user-local dri path is checked for iHD VA-API driver before system paths
+_user_dri = os.path.expanduser("~/.local/lib/dri")
+_system_dri = "/usr/lib/x86_64-linux-gnu/dri"
+_cur_drivers = os.environ.get("LIBVA_DRIVERS_PATH", "")
+if _user_dri not in _cur_drivers:
+    os.environ["LIBVA_DRIVERS_PATH"] = f"{_user_dri}:{_system_dri}" if not _cur_drivers else f"{_user_dri}:{_cur_drivers}"
+os.environ["LIBVA_DRIVER_NAME"] = "iHD"
 
 import gi
 
@@ -65,6 +71,9 @@ IFACE_XML = """
     <method name="SetFps">
       <arg type="i" name="fps" direction="in"/>
     </method>
+    <method name="SetActivityMode">
+      <arg type="s" name="mode" direction="in"/>
+    </method>
     <method name="SetCrossfade">
       <arg type="b" name="enabled" direction="in"/>
       <arg type="i" name="duration_ms" direction="in"/>
@@ -105,11 +114,14 @@ VA_DECODERS = (
     "vaav1dec",
     "vavp9dec",
     "vajpegdec",
+    "vapostproc",
+)
+LEGACY_VAAPI_DECODERS = (
     "vaapih264dec",
     "vaapih265dec",
     "vaapivp9dec",
+    "vaapidecodebin",
     "vaapipostproc",
-    "vapostproc",
 )
 NVIDIA_DECODERS = (
     "nvh264dec",
@@ -140,6 +152,10 @@ def log(message: str) -> None:
 def prefer_vaapi() -> None:
     registry = Gst.Registry.get()
     for name in NVIDIA_DECODERS:
+        feature = registry.find_feature(name, Gst.ElementFactory.__gtype__)
+        if feature is not None:
+            feature.set_rank(Gst.Rank.NONE)
+    for name in LEGACY_VAAPI_DECODERS:
         feature = registry.find_feature(name, Gst.ElementFactory.__gtype__)
         if feature is not None:
             feature.set_rank(Gst.Rank.NONE)
@@ -559,6 +575,7 @@ class RendererApp(Gtk.Application):
         self.volume = 0.0
         self.scale_mode = "fill"
         self.fps = 30
+        self.activity_mode = "desktop"
         self.crossfade = True
         self.crossfade_ms = 600
         self.paused_monitors: set[int] = set()
@@ -744,6 +761,14 @@ class RendererApp(Gtk.Application):
         elif not self.user_paused:
             self.resume_playback()
 
+    def apply_activity_fps(self) -> None:
+        configured = max(5, min(60, int(self.fps)))
+        effective = min(configured, 10) if self.activity_mode in ("overview", "switcher") else configured
+        if self.player_a:
+            self.player_a.set_fps(effective)
+        if self.player_b:
+            self.player_b.set_fps(effective)
+
     def _on_method_call(
         self, _connection, _sender, _path, _iface, method, parameters, invocation
     ):
@@ -793,8 +818,13 @@ class RendererApp(Gtk.Application):
             invocation.return_value(None)
         elif method == "SetFps":
             (self.fps,) = parameters.unpack()
-            self.player_a.set_fps(self.fps)
-            self.player_b.set_fps(self.fps)
+            self.apply_activity_fps()
+            invocation.return_value(None)
+        elif method == "SetActivityMode":
+            (mode,) = parameters.unpack()
+            mode = str(mode).strip().lower()
+            self.activity_mode = mode if mode in ("desktop", "overview", "switcher") else "desktop"
+            self.apply_activity_fps()
             invocation.return_value(None)
         elif method == "SetCrossfade":
             enabled, duration = parameters.unpack()

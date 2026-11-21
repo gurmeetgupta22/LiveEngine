@@ -33,6 +33,9 @@ export default class LiveEngineExtension extends Extension {
         this._lastPauseAll = null;
         this._lastPausedMonitors = null;
         this._indicator = null;
+        this._overviewShowingId = 0;
+        this._overviewHidingId = 0;
+        this._activityMode = 'desktop';
 
         this._ipc = new RendererIpc();
         this._process = new RendererProcess(this);
@@ -88,6 +91,8 @@ export default class LiveEngineExtension extends Extension {
             Main.sessionMode.disconnect(this._sessionId);
             this._sessionId = 0;
         }
+        this._disconnectShellActivity();
+
         if (this._sleepId) {
             Gio.DBus.system.signal_unsubscribe(this._sleepId);
             this._sleepId = 0;
@@ -226,6 +231,27 @@ export default class LiveEngineExtension extends Extension {
     _connectSession() {
         this._onSessionMode();
         this._sessionId = Main.sessionMode.connect('updated', () => this._onSessionMode());
+        this._overviewShowingId = Main.overview.connect('showing', () => this._setActivityMode('overview'));
+        this._overviewHidingId = Main.overview.connect('hidden', () => this._setActivityMode('desktop'));
+        this._setActivityMode(Main.overview.visible ? 'overview' : 'desktop');
+    }
+
+    _disconnectShellActivity() {
+        if (this._overviewShowingId) {
+            Main.overview?.disconnect(this._overviewShowingId);
+            this._overviewShowingId = 0;
+        }
+        if (this._overviewHidingId) {
+            Main.overview?.disconnect(this._overviewHidingId);
+            this._overviewHidingId = 0;
+        }
+    }
+
+    _setActivityMode(mode) {
+        if (this._activityMode === mode)
+            return;
+        this._activityMode = mode;
+        this._ipc?.setActivityMode(mode);
     }
 
     _onSessionMode() {
@@ -274,6 +300,7 @@ export default class LiveEngineExtension extends Extension {
         this._ipc.setVolume(this._settings.get_int('volume') / 100);
         this._ipc.setScaleMode(this._settings.get_string('scale-mode'));
         this._ipc.setFps(this._settings.get_int('max-fps'));
+        this._ipc.setActivityMode(this._activityMode);
         this._ipc.setCrossfade(
             this._settings.get_boolean('crossfade'),
             this._settings.get_int('crossfade-ms')
